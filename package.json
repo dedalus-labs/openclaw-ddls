@@ -8,7 +8,7 @@
     "chat": "npx tsx chat.ts"
   },
   "dependencies": {
-    "dedalus-labs": "latest",
+    "dedalus": "latest",
     "dotenv": "latest"
   },
   "devDependencies": {

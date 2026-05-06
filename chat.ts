@@ -1,9 +1,8 @@
 import "dotenv/config";
-import Dedalus from "dedalus-labs";
+import Dedalus from "dedalus";
 
 const client = new Dedalus({
   xAPIKey: process.env.DEDALUS_API_KEY,
-  baseURL: "https://dev.dcs.dedaluslabs.ai",
 });
 
 const MACHINE_ID = process.argv[2];
@@ -15,30 +14,35 @@ if (!MACHINE_ID) {
 
 const message = process.argv.slice(3).join(" ") || "Hello! What are you?";
 
+const TERMINAL = new Set(["succeeded", "failed", "cancelled", "expired"]);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function exec(cmd: string, timeoutMs = 120000): Promise<string> {
-  const e = await client.machines.executions.create({
+  let exc = await client.machines.executions.create({
     machine_id: MACHINE_ID,
     command: ["/bin/bash", "-c", cmd],
     timeout_ms: timeoutMs,
   });
 
-  let result = e;
-  while (result.status !== "succeeded" && result.status !== "failed") {
-    await new Promise((r) => setTimeout(r, 1000));
-    result = await client.machines.executions.retrieve({
+  let delay = 100;
+  while (!TERMINAL.has(exc.status)) {
+    const wait = exc.status === "wake_in_progress" ? (exc.retry_after_ms ?? 0) : delay;
+    await sleep(wait);
+    delay = Math.min(delay * 2, 2000);
+    exc = await client.machines.executions.retrieve({
       machine_id: MACHINE_ID,
-      execution_id: e.execution_id,
+      execution_id: exc.execution_id,
     });
+  }
+
+  if (exc.status !== "succeeded") {
+    throw new Error(`${exc.status}: ${exc.error_code ?? ""}: ${exc.error_message ?? ""}`);
   }
 
   const output = await client.machines.executions.output({
     machine_id: MACHINE_ID,
-    execution_id: e.execution_id,
+    execution_id: exc.execution_id,
   });
-
-  if (result.status === "failed") {
-    throw new Error(output.stderr ?? output.stdout ?? "exec failed");
-  }
   return output.stdout?.trim() ?? "";
 }
 

@@ -1,9 +1,8 @@
 import "dotenv/config";
-import Dedalus from "dedalus-labs";
+import Dedalus from "dedalus";
 
 const client = new Dedalus({
   xAPIKey: process.env.DEDALUS_API_KEY,
-  baseURL: "https://dev.dcs.dedaluslabs.ai",
 });
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
@@ -13,12 +12,15 @@ if (!ANTHROPIC_KEY) {
 }
 
 const ENV = [
-  "export PATH=/home/machine/.npm-global/bin:$PATH",
+  "export PATH=/home/machine/nodejs/bin:/home/machine/.npm-global/bin:$PATH",
   "export HOME=/home/machine",
   "export OPENCLAW_STATE_DIR=/home/machine/.openclaw",
   "export NODE_COMPILE_CACHE=/home/machine/.compile-cache",
   "export OPENCLAW_NO_RESPAWN=1",
 ].join(" && ");
+
+const TERMINAL = new Set(["succeeded", "failed", "cancelled", "expired"]);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function exec(
   mid: string,
@@ -27,34 +29,37 @@ async function exec(
   timeoutMs = 120000,
 ): Promise<string> {
   console.log(`\n> ${label}`);
-  const e = await client.machines.executions.create({
+  let exc = await client.machines.executions.create({
     machine_id: mid,
     command: ["/bin/bash", "-c", cmd],
     timeout_ms: timeoutMs,
   });
 
-  let result = e;
-  while (result.status !== "succeeded" && result.status !== "failed") {
-    await new Promise((r) => setTimeout(r, 1000));
-    result = await client.machines.executions.retrieve({
+  let delay = 100;
+  while (!TERMINAL.has(exc.status)) {
+    const wait = exc.status === "wake_in_progress" ? (exc.retry_after_ms ?? 0) : delay;
+    await sleep(wait);
+    delay = Math.min(delay * 2, 2000);
+    exc = await client.machines.executions.retrieve({
       machine_id: mid,
-      execution_id: e.execution_id,
+      execution_id: exc.execution_id,
     });
+  }
+
+  if (exc.status !== "succeeded") {
+    console.error(`[${exc.status.toUpperCase()}] ${label}`);
+    throw new Error(`${label}: ${exc.status}: ${exc.error_code ?? ""}: ${exc.error_message ?? ""}`);
   }
 
   const output = await client.machines.executions.output({
     machine_id: mid,
-    execution_id: e.execution_id,
+    execution_id: exc.execution_id,
   });
 
   const stdout = output.stdout?.trim() ?? "";
   const stderr = output.stderr?.trim() ?? "";
   if (stdout) console.log(stdout);
   if (stderr) console.error("[stderr]", stderr);
-  if (result.status === "failed") {
-    console.error(`[FAILED] ${label}`);
-    throw new Error(`${label}: ${stderr || stdout || "no output"}`);
-  }
   return stdout;
 }
 
@@ -86,20 +91,24 @@ await waitForRunning(mid);
 // 2. Install Node.js + OpenClaw
 await exec(
   mid,
-  "curl -fsSL https://deb.nodesource.com/setup_22.x 2>&1 | bash - 2>&1 | tail -3 " +
-    "&& apt-get install -y nodejs 2>&1 | tail -3",
+  "mkdir -p /home/machine/nodejs && " +
+    "curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz | " +
+    "tar -xz -C /home/machine/nodejs --strip-components=1 && " +
+    "/home/machine/nodejs/bin/node --version",
   "Install Node.js 22",
 );
 
 await exec(
   mid,
-  "mkdir -p /home/machine/.npm-global /home/machine/.npm-cache " +
+  "export PATH=/home/machine/nodejs/bin:$PATH && " +
+    "mkdir -p /home/machine/.npm-global /home/machine/.npm-cache " +
     "/home/machine/.tmp /home/machine/.openclaw /home/machine/.compile-cache && " +
     "NPM_CONFIG_PREFIX=/home/machine/.npm-global " +
     "NPM_CONFIG_CACHE=/home/machine/.npm-cache " +
     "TMPDIR=/home/machine/.tmp " +
     "npm install -g openclaw@latest 2>&1 | tail -5",
   "Install OpenClaw",
+  300000,
 );
 
 await exec(mid, `${ENV} && openclaw --version`, "Verify OpenClaw");
@@ -120,12 +129,17 @@ await exec(
   `${ENV} && openclaw config set gateway.http.endpoints.chatCompletions.enabled true 2>&1`,
   "Enable /v1/chat/completions",
 );
+await exec(
+  mid,
+  `cat /home/machine/.openclaw/openclaw.json`,
+  "Dump openclaw config",
+);
 
 // 4. Write startup script (echo commands -- heredocs don't work through the exec API)
 await exec(
   mid,
   `echo '#!/bin/bash' > /home/machine/start-gateway.sh && ` +
-    `echo 'export PATH=/home/machine/.npm-global/bin:$PATH' >> /home/machine/start-gateway.sh && ` +
+    `echo 'export PATH=/home/machine/nodejs/bin:/home/machine/.npm-global/bin:$PATH' >> /home/machine/start-gateway.sh && ` +
     `echo 'export HOME=/home/machine' >> /home/machine/start-gateway.sh && ` +
     `echo 'export OPENCLAW_STATE_DIR=/home/machine/.openclaw' >> /home/machine/start-gateway.sh && ` +
     `echo 'export NODE_COMPILE_CACHE=/home/machine/.compile-cache' >> /home/machine/start-gateway.sh && ` +
@@ -143,6 +157,7 @@ await exec(
 );
 
 // 6. Verify
+await exec(mid, "cat /home/machine/.openclaw/gateway.log 2>/dev/null || echo '(no log yet)'", "Gateway log");
 await exec(mid, "ss -tlnp | grep 18789 || echo 'NOT LISTENING'", "Port 18789");
 await exec(
   mid,
@@ -162,6 +177,7 @@ const chatResponse = await exec(
   mid,
   `curl -sS http://127.0.0.1:18789/v1/chat/completions ` +
     `-H 'Content-Type: application/json' ` +
+    `-H 'x-openclaw-model: anthropic/claude-sonnet-4-6' ` +
     `-d '{"model":"openclaw/default","messages":[{"role":"user","content":"Hello! Reply in one sentence: what are you?"}]}'`,
   "POST /v1/chat/completions",
   120000,
@@ -179,6 +195,7 @@ const followUp = await exec(
   mid,
   `curl -sS http://127.0.0.1:18789/v1/chat/completions ` +
     `-H 'Content-Type: application/json' ` +
+    `-H 'x-openclaw-model: anthropic/claude-sonnet-4-6' ` +
     `-d '{"model":"openclaw/default","user":"demo-session","messages":[{"role":"user","content":"What is 2+2? Reply in one word."}]}'`,
   "POST /v1/chat/completions (follow-up)",
   120000,
